@@ -1,0 +1,9 @@
+build/
+release/
+nexus/
+package/F4SE/Plugins/*.dll
+*.obj
+*.exp
+*.lib
+*.pdb
+__pycache__/
