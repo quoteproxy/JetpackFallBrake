@@ -1,5 +1,6 @@
 # Jetpack Fall Brake
 
+<a href="https://www.nexusmods.com/fallout4/mods/111658"><img src="https://img.shields.io/badge/download-Nexus_Mods-D98F40" alt="Download on Nexus Mods"></a>
 <a href="LICENSE"><img src="https://img.shields.io/github/license/quoteproxy/JetpackFallBrake" alt="MIT license"></a>
 <a href="https://buymeacoffee.com/quoteproxy"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Support on Buy Me a Coffee"></a>
 
