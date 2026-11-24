@@ -1,4 +1,4 @@
-// JetpackFallBrake - F4SE plugin for Fallout 4 (1.11.x).
+// JetpackFallBrake - F4SE plugin for Fallout 4 (1.10.163, 1.10.980+ and 1.11.x).
 //
 // Vanilla behaviour: the power armor jetpack integrates its own vertical speed every frame as
 //   vz += (thrust - 100) * 6.8693 * dt
@@ -36,7 +36,8 @@
 // the jetpack fires downwards (bFallDamageFromSpeed), so a soft landing after braking does no damage.
 //
 // The code is found by byte pattern (no hardcoded addresses). If the pattern is not found exactly once,
-// nothing is patched and the reason is logged.
+// nothing is patched and the reason is logged. 1.10.163 (before the next gen update) has the same code with
+// other registers in the thrust block, so that block has a pattern for each build.
 
 #define NOMINMAX
 #include <windows.h>
@@ -64,6 +65,7 @@ namespace
 	};
 
 	FILE* g_log = nullptr;
+	std::uintptr_t g_moduleBase = 0;  // Fallout4.exe (set before Install)
 
 	struct Config
 	{
@@ -152,7 +154,7 @@ namespace
 
 	bool Section(const char* name, std::uintptr_t& begin, std::size_t& size)
 	{
-		const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+		const auto base = g_moduleBase;
 		const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
 		const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
 		const auto* sec = IMAGE_FIRST_SECTION(nt);
@@ -373,7 +375,7 @@ namespace
 		return std::max(thrust, kHoverThrust + accel / g_accelPerThrust);
 	}
 
-	// Starting speed of a mid-air firing. The game's check (Fallout4.exe+C5BE80) is "character in the air and
+	// Starting speed of a mid-air firing. The game's check (Fallout4.exe+C5BE80 on 1.11.240) is "character in the air and
 	// falling faster than 700 units/s"; only then does the jetpack start from the real vertical speed. This copy
 	// of it, used only by the jetpack start, accepts any downward speed.
 	using GetCharControllerFn = void* (*)(void* process);
@@ -467,8 +469,79 @@ namespace
 		return reinterpret_cast<const float*>(instr + length + disp);
 	}
 
+	// The jetpack update: thrust selection (initial/sustained blend) followed by "elapsed += dt; store elapsed",
+	// and later in the same function the integration of the vertical speed at [rdi+0xD0]:
+	//   vz += thrust_minus_100 * accelPerThrust * dt
+	// Both builds have the same instructions at the same offsets; 1.10.980+ (next gen and 1.11.x) keeps elapsed in
+	// xmm1 and the blend in xmm2, 1.10.163 the other way round.
+	struct ThrustCode
+	{
+		const char* build;
+		std::uint8_t elapsedReg;     // xmm register that holds elapsed at the hook
+		std::vector<int> block;      // hook at +0x41, 13 bytes
+		std::vector<int> integrate;  // within 0x300 bytes after the hook
+	};
+
+	const ThrustCode kThrustCode[] = {
+		{ "1.10.980+", 1,
+			{
+				0xF3, 0x0F, 0x10, 0x05, -1, -1, -1, -1,          // movss xmm0, [fJetpackTimeToSustained]
+				0x0F, 0x2F, 0xC8,                                // comiss xmm1, xmm0
+				0x73, 0x2C,                                      // jae sustained
+				0x0F, 0x28, 0xD0,                                // movaps xmm2, xmm0
+				0x0F, 0x28, 0xF7,                                // movaps xmm6, xmm7
+				0xF3, 0x0F, 0x5C, 0xD1,                          // subss xmm2, xmm1
+				0xF3, 0x0F, 0x5E, 0xD0,                          // divss xmm2, xmm0
+				0xF3, 0x0F, 0x10, 0x05, -1, -1, -1, -1,          // movss xmm0, [fJetpackThrustInitial]   (+0x1B)
+				0xF3, 0x0F, 0x5C, 0xF2,                          // subss xmm6, xmm2
+				0xF3, 0x0F, 0x59, 0xC2,                          // mulss xmm0, xmm2
+				0xF3, 0x0F, 0x59, 0x35, -1, -1, -1, -1,          // mulss xmm6, [fJetpackThrustSustained] (+0x2B)
+				0xF3, 0x0F, 0x58, 0xF0,                          // addss xmm6, xmm0
+				0xEB, 0x08,                                      // jmp hook
+				0xF3, 0x0F, 0x10, 0x35, -1, -1, -1, -1,          // movss xmm6, [fJetpackThrustSustained] (+0x39)
+				0xF3, 0x0F, 0x58, 0x4D, 0x00,                    // hook (+0x41): addss xmm1, [rbp]   (elapsed += dt)
+				0xF3, 0x0F, 0x11, 0x8F, 0xD4, 0x00, 0x00, 0x00,  //            movss [rdi+0xD4], xmm1
+			},
+			{
+				0xF3, 0x0F, 0x59, 0x35, -1, -1, -1, -1,          // mulss xmm6, [accelPerThrust]
+				0xF3, 0x0F, 0x59, 0x75, 0x00,                    // mulss xmm6, [rbp]          (dt)
+				0xF3, 0x0F, 0x58, 0xB7, 0xD0, 0x00, 0x00, 0x00,  // addss xmm6, [rdi+0xD0]
+				0xF3, 0x0F, 0x11, 0xB7, 0xD0, 0x00, 0x00, 0x00,  // movss [rdi+0xD0], xmm6
+			} },
+		{ "1.10.163", 2,
+			{
+				0xF3, 0x0F, 0x10, 0x05, -1, -1, -1, -1,          // movss xmm0, [fJetpackTimeToSustained]
+				0x0F, 0x2F, 0xD0,                                // comiss xmm2, xmm0
+				0x73, 0x2C,                                      // jae sustained
+				0x0F, 0x28, 0xC8,                                // movaps xmm1, xmm0
+				0x0F, 0x28, 0xF7,                                // movaps xmm6, xmm7
+				0xF3, 0x0F, 0x5C, 0xCA,                          // subss xmm1, xmm2
+				0xF3, 0x0F, 0x5E, 0xC8,                          // divss xmm1, xmm0
+				0xF3, 0x0F, 0x10, 0x05, -1, -1, -1, -1,          // movss xmm0, [fJetpackThrustInitial]   (+0x1B)
+				0xF3, 0x0F, 0x59, 0xC1,                          // mulss xmm0, xmm1
+				0xF3, 0x0F, 0x5C, 0xF1,                          // subss xmm6, xmm1
+				0xF3, 0x0F, 0x59, 0x35, -1, -1, -1, -1,          // mulss xmm6, [fJetpackThrustSustained] (+0x2B)
+				0xF3, 0x0F, 0x58, 0xF0,                          // addss xmm6, xmm0
+				0xEB, 0x08,                                      // jmp hook
+				0xF3, 0x0F, 0x10, 0x35, -1, -1, -1, -1,          // movss xmm6, [fJetpackThrustSustained] (+0x39)
+				0xF3, 0x0F, 0x58, 0x55, 0x00,                    // hook (+0x41): addss xmm2, [rbp]   (elapsed += dt)
+				0xF3, 0x0F, 0x11, 0x97, 0xD4, 0x00, 0x00, 0x00,  //            movss [rdi+0xD4], xmm2
+			},
+			{
+				0xF3, 0x0F, 0x59, 0x35, -1, -1, -1, -1,          // mulss xmm6, [accelPerThrust]
+				0xF3, 0x0F, 0x59, 0x75, 0x00,                    // mulss xmm6, [rbp]          (dt)
+				0xF3, 0x0F, 0x11, 0x44, 0x24, 0x20,              // movss [rsp+0x20], xmm0
+				0xF3, 0x0F, 0x11, 0x4C, 0x24, 0x24,              // movss [rsp+0x24], xmm1
+				0xF3, 0x0F, 0x58, 0xB7, 0xD0, 0x00, 0x00, 0x00,  // addss xmm6, [rdi+0xD0]
+				0xF3, 0x0F, 0x11, 0xB7, 0xD0, 0x00, 0x00, 0x00,  // movss [rdi+0xD0], xmm6
+			} },
+	};
+
 	void Install()
 	{
+		if (!g_moduleBase) {
+			g_moduleBase = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+		}
 		const std::wstring ini = IniPath();
 		const bool enabled = GetPrivateProfileIntW(L"General", L"bEnabled", 1, ini.c_str()) != 0;
 		g_cfg.climbSpeed = IniFloat(ini, L"fClimbSpeed", g_cfg.climbSpeed);
@@ -491,43 +564,27 @@ namespace
 			return;
 		}
 
-		// jetpack update: thrust selection (initial/sustained blend) followed by "elapsed += dt; store elapsed"
-		const std::vector<int> pat = {
-			0xF3, 0x0F, 0x10, 0x05, -1, -1, -1, -1,          // movss xmm0, [fJetpackTimeToSustained]
-			0x0F, 0x2F, 0xC8,                                // comiss xmm1, xmm0
-			0x73, 0x2C,                                      // jae sustained
-			0x0F, 0x28, 0xD0,                                // movaps xmm2, xmm0
-			0x0F, 0x28, 0xF7,                                // movaps xmm6, xmm7
-			0xF3, 0x0F, 0x5C, 0xD1,                          // subss xmm2, xmm1
-			0xF3, 0x0F, 0x5E, 0xD0,                          // divss xmm2, xmm0
-			0xF3, 0x0F, 0x10, 0x05, -1, -1, -1, -1,          // movss xmm0, [fJetpackThrustInitial]   (+0x1B)
-			0xF3, 0x0F, 0x5C, 0xF2,                          // subss xmm6, xmm2
-			0xF3, 0x0F, 0x59, 0xC2,                          // mulss xmm0, xmm2
-			0xF3, 0x0F, 0x59, 0x35, -1, -1, -1, -1,          // mulss xmm6, [fJetpackThrustSustained]
-			0xF3, 0x0F, 0x58, 0xF0,                          // addss xmm6, xmm0
-			0xEB, 0x08,                                      // jmp hook
-			0xF3, 0x0F, 0x10, 0x35, -1, -1, -1, -1,          // movss xmm6, [fJetpackThrustSustained]
-			0xF3, 0x0F, 0x58, 0x4D, 0x00,                    // hook (+0x41): addss xmm1, [rbp]   (elapsed += dt)
-			0xF3, 0x0F, 0x11, 0x8F, 0xD4, 0x00, 0x00, 0x00,  //            movss [rdi+0xD4], xmm1
-		};
-		const auto hits = FindAll(text, textSize, pat);
-		if (hits.size() != 1) {
-			Log("jetpack thrust code: expected 1 match, found %zu. Nothing patched.", hits.size());
+		// jetpack update: one of the builds' thrust blocks must match exactly once
+		const ThrustCode* code = nullptr;
+		std::uintptr_t start = 0;
+		std::size_t matches = 0;
+		for (const auto& c : kThrustCode) {
+			const auto hits = FindAll(text, textSize, c.block);
+			matches += hits.size();
+			if (hits.size() == 1) {
+				code = &c;
+				start = hits[0];
+			}
+		}
+		if (matches != 1 || !code) {
+			Log("jetpack thrust code: expected 1 match, found %zu. Nothing patched.", matches);
 			return;
 		}
-		const std::uintptr_t start = hits[0];
 		const std::uintptr_t hook = start + 0x41;
 		const std::uintptr_t resume = hook + 13;
 
-		// the same function must integrate the jetpack's vertical speed at [rdi+0xD0]:
-		//   vz += thrust_minus_100 * accelPerThrust * dt
-		const std::vector<int> integ = {
-			0xF3, 0x0F, 0x59, 0x35, -1, -1, -1, -1,          // mulss xmm6, [accelPerThrust]
-			0xF3, 0x0F, 0x59, 0x75, 0x00,                    // mulss xmm6, [rbp]          (dt)
-			0xF3, 0x0F, 0x58, 0xB7, 0xD0, 0x00, 0x00, 0x00,  // addss xmm6, [rdi+0xD0]
-			0xF3, 0x0F, 0x11, 0xB7, 0xD0, 0x00, 0x00, 0x00,  // movss [rdi+0xD0], xmm6
-		};
-		const auto integHits = FindAll(hook, 0x300, integ);
+		// the same function must integrate the jetpack's vertical speed at [rdi+0xD0]
+		const auto integHits = FindAll(hook, 0x300, code->integrate);
 		if (integHits.size() != 1) {
 			Log("vertical speed field [+0xD0] not confirmed near the hook. Nothing patched.");
 			return;
@@ -553,27 +610,32 @@ namespace
 			return;
 		}
 
-		// At the hook: rdi = jetpack, rbp -> dt, xmm1 = elapsed (before += dt), xmm6 = thrust.
+		// At the hook: rdi = jetpack, rbp -> dt, xmmE = elapsed (before += dt; E = 1 or 2), xmm6 = thrust.
 		// xmm1 and xmm2 are still used after the hook; rsp is 16-byte aligned here.
+		const std::uint8_t el = code->elapsedReg;
+		const auto elMem = static_cast<std::uint8_t>(0x87 | (el << 3));  // ModRM: xmmE, [rdi+disp32]
+		const auto elDt = static_cast<std::uint8_t>(0x45 | (el << 3));   // ModRM: xmmE, [rbp+0]
 		Emitter e{ stub };
 		e.pushVolatile();
 		e.bytes({ 0x48, 0x89, 0xF9 });                                // mov rcx, rdi        (jetpack)
-		e.bytes({ 0x0F, 0x28, 0xD1 });                                // movaps xmm2, xmm1   (elapsed)
+		if (el != 2) {
+			e.bytes({ 0x0F, 0x28, static_cast<std::uint8_t>(0xD0 | el) });  // movaps xmm2, xmmE (elapsed)
+		}
 		e.bytes({ 0x0F, 0x28, 0xCE });                                // movaps xmm1, xmm6   (thrust)
 		e.bytes({ 0xF3, 0x0F, 0x10, 0x5D, 0x00 });                    // movss xmm3, [rbp]   (dt)
 		e.callAbs(reinterpret_cast<const void*>(&JetpackThrust));
 		e.bytes({ 0x0F, 0x28, 0xF0 });                                // movaps xmm6, xmm0   (new thrust)
 		e.popVolatile();
-		e.bytes({ 0xF3, 0x0F, 0x10, 0x8F, 0xD4, 0x00, 0x00, 0x00 });  // movss xmm1, [rdi+0xD4] (elapsed, may have changed)
-		e.bytes({ 0xF3, 0x0F, 0x58, 0x4D, 0x00 });                    // addss xmm1, [rbp]   (original)
-		e.bytes({ 0xF3, 0x0F, 0x11, 0x8F, 0xD4, 0x00, 0x00, 0x00 });  // movss [rdi+0xD4], xmm1
+		e.bytes({ 0xF3, 0x0F, 0x10, elMem, 0xD4, 0x00, 0x00, 0x00 }); // movss xmmE, [rdi+0xD4] (elapsed, may have changed)
+		e.bytes({ 0xF3, 0x0F, 0x58, elDt, 0x00 });                    // addss xmmE, [rbp]   (original)
+		e.bytes({ 0xF3, 0x0F, 0x11, elMem, 0xD4, 0x00, 0x00, 0x00 }); // movss [rdi+0xD4], xmmE
 		e.jmpAbs(resume);
 		FlushInstructionCache(GetCurrentProcess(), stub, 0x200);
 		WriteJump(hook, 13, stub);
 
-		const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-		Log("patched jetpack update at Fallout4.exe+%llX (stub at %p)",
-			static_cast<unsigned long long>(hook - base), stub);
+		const auto base = g_moduleBase;
+		Log("patched jetpack update at Fallout4.exe+%llX (%s code, stub at %p)",
+			static_cast<unsigned long long>(hook - base), code->build, stub);
 
 		// Second hook, later in the same function: the block that records where a fall starts
 		//   if (vz < 0 && GetFallDistance(controller) <= 0) controller->fallStartZ = GetPosition(controller).z;
@@ -726,9 +788,10 @@ extern "C"
 		std::uint8_t reserved[512];
 	};
 
+	// F4SE 0.7.x (1.10.980+) reads this
 	__declspec(dllexport) F4SEPluginVersionData F4SEPlugin_Version = {
 		1,                    // dataVersion
-		0x01000000,           // 1.0.0 (first public release)
+		0x01010000,           // 1.1.0
 		"JetpackFallBrake",
 		"",
 		1u << 0,              // kAddressIndependence_Signatures
@@ -737,10 +800,28 @@ extern "C"
 		0, 0, 0, { 0 }
 	};
 
+	// F4SE 0.6.x (1.10.163) calls this before F4SEPlugin_Load; 0.7.x ignores it
+	struct PluginInfo
+	{
+		std::uint32_t infoVersion;
+		const char* name;
+		std::uint32_t version;
+	};
+
+	__declspec(dllexport) bool F4SEPlugin_Query(const F4SEInterface* f4se, PluginInfo* info)
+	{
+		if (info) {
+			info->infoVersion = 1;
+			info->name = "JetpackFallBrake";
+			info->version = 0x01010000;
+		}
+		return f4se && !f4se->isEditor;
+	}
+
 	__declspec(dllexport) bool F4SEPlugin_Load(const F4SEInterface* f4se)
 	{
 		OpenLog();
-		Log("JetpackFallBrake 1.0.0 (F4SE %08X, runtime %08X)", f4se ? f4se->f4seVersion : 0, f4se ? f4se->runtimeVersion : 0);
+		Log("JetpackFallBrake 1.1.0 (F4SE %08X, runtime %08X)", f4se ? f4se->f4seVersion : 0, f4se ? f4se->runtimeVersion : 0);
 		if (f4se && f4se->isEditor) {
 			return false;
 		}
